@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"math"
 	"math/cmplx"
 	"math/rand"
 	"os"
@@ -58,8 +59,9 @@ func Cheese(s *settings) *image.RGBA {
 	}
 
 	colorFunc := func(x int) float64 {
-		return float64(x)
-		//return math.Log2(float64(x-min) + 1)
+		//return float64(x)
+		// Gamma correction to emphasize darker areas.
+		return math.Pow(float64(x-min), 1/1.1)
 	}
 
 	scale := 255 / colorFunc(max)
@@ -96,6 +98,8 @@ func recordPath(c complex128, countRef *[]int, path *[]complex128, can *canvas) 
 	}
 
 	if atIteration == maxIterations {
+		// Filter by min iterations here too?
+		//if atIteration == maxIterations || atIteration < 10000 {
 		return
 	}
 
@@ -138,34 +142,53 @@ func samplePoints(s *settings) chan complex128 {
 
 	fmt.Println("Calculating candidates for trajectory tracing...")
 
-	// We need to reduce our candidate set to points that have not
-	// escaped after MIN iterations. From this set we will plot
-	// trajectories for points that DO escape within MAX iterations.
+	// We need to reduce our candidate set to points near the edge of the M
+	// set. These points take longer to escape and have more interesting
+	// trajectories as a result.
 	img := image.NewRGBA(image.Rect(0, 0, s.Canvas.Width, s.Canvas.Height))
 
+	// Need to clean this up...
+	var wg sync.WaitGroup
+
 	for c := range s.Canvas.Coordinates() {
-		x, y, err := s.Canvas.PixelFor(c)
-		img.SetRGBA(x, y, color.RGBA{R: 0, G: 0, B: 0, A: 255})
+		wg.Add(1)
+		go func(c complex128) {
+			x, y, err := s.Canvas.PixelFor(c)
+			img.SetRGBA(x, y, color.RGBA{R: 0, G: 0, B: 0, A: 255})
 
-		// Now see if we can iterate MIN times without it escaping.
-		z := complex(0, 0)
+			// Distance estimation.
+			z := complex(0, 0)
+			dz := complex(0, 0)
 
-		for i := 0; i < s.minIterations; i++ {
-			z = z*z + c
-			if hasEscaped(z) {
-				break
+			for i := 0; i < s.minIterations; i++ {
+				z, dz = z*z+c, 2*z*dz+1
+				if hasEscaped(z) {
+					break
+				}
 			}
-		}
 
-		if !hasEscaped(z) {
-			candidates = append(candidates, c)
-			if err == nil {
-				img.SetRGBA(x, y, color.RGBA{R: 255, G: 0, B: 0, A: 255})
-			} else {
-				fmt.Println("WTF")
+			Z := cmplx.Abs(z)
+			DZ := cmplx.Abs(dz)
+
+			dist := math.Log(Z*Z) * Z / DZ
+
+			// The point isn't IN the M set but it's near the edge.
+			if dist > 0 && dist < s.Canvas.unitsPerPixel() {
+				//if !hasEscaped(z) {
+				A := uint8(255)
+				//A := uint8(clamp(-30*math.Log10(dist), 0, 255))
+				candidates = append(candidates, c)
+				if err == nil {
+					img.SetRGBA(x, y, color.RGBA{R: A, G: 0, B: 0, A: 255})
+				} else {
+					fmt.Println("WTF")
+				}
 			}
-		}
+			wg.Done()
+		}(c)
 	}
+
+	wg.Wait()
 
 	f, _ := os.Create("foo.png")
 	png.Encode(f, img)
@@ -211,7 +234,7 @@ func samplePoints(s *settings) chan complex128 {
 				samples <- c
 
 			case <-done:
-				fmt.Println("Recorded", sampled, "trajectories!", "(", float64(sampled)/float64(s.Canvas.Size()), "per pixel)")
+				fmt.Println("Recorded", sampled, "trajectories!")
 				close(samples)
 				return
 			}
@@ -231,10 +254,12 @@ func willNeverEscape(z complex128) bool {
 	re := real(z)
 	imsq := imag(z) * imag(z)
 
+	// Period-2 bulb.
 	if (re+1)*(re+1)+imsq < 1.0/16.0 {
 		return true
 	}
 
+	// Main bulb.
 	var q float64 = (re-1.0/4.0)*(re-1.0/4.0) + imsq
 
 	return 4*q*(q+re-1.0/4.0) < imsq
